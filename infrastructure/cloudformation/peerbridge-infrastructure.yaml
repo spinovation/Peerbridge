@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'PeerBridge Infrastructure - RDS, Lambda, S3, API Gateway'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+  
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password for PostgreSQL
+    MinLength: 8
+  
+  SendGridApiKey:
+    Type: String
+    NoEcho: true
+    Description: SendGrid API key for email sending
+
+Resources:
+  # VPC and Security Groups
+  PeerBridgeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for PeerBridge Lambda functions
+      VpcId: !Ref AWS::NoValue  # Use default VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-lambda-sg'
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for PeerBridge RDS database
+      VpcId: !Ref AWS::NoValue  # Use default VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref PeerBridgeSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-db-sg'
+
+  # RDS PostgreSQL Database
+  PeerBridgeDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-peerbridge-db'
+      DBName: peerbridge
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      EngineVersion: '17.4'
+      MasterUsername: peerbridge_admin
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: 20
+      StorageType: gp2
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-database'
+
+  # S3 Buckets
+  StaticWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-static-site'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-static-site'
+
+  SalesAdminBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-sales-admin'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-sales-admin'
+
+  UserUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-user-uploads'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-user-uploads'
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-peerbridge-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: PeerBridgeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${UserUploadsBucket}/*'
+                  - !Sub '${StaticWebsiteBucket}/*'
+        - PolicyName: PeerBridgeRDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:Connect
+                Resource: '*'
+
+  # Lambda Function
+  PeerBridgeLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-peerbridge-backend-function'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': 'PeerBridge Lambda Function - Please deploy actual code'
+              }
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt PeerBridgeDatabase.Endpoint.Address
+          DB_NAME: peerbridge
+          DB_USER: peerbridge_admin
+          DB_PASSWORD: !Ref DBPassword
+          DB_PORT: '5432'
+          SENDGRID_API_KEY: !Ref SendGridApiKey
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 128
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-lambda'
+
+  # API Gateway
+  PeerBridgeApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${Environment}-peerbridge-api'
+      Description: PeerBridge Backend API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeApi
+      ParentId: !GetAtt PeerBridgeApi.RootResourceId
+      PathPart: 'api'
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PeerBridgeLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${PeerBridgeApi}/*/ANY/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - ApiResource
+    Properties:
+      RestApiId: !Ref PeerBridgeApi
+      StageName: Prod
+
+Outputs:
+  DatabaseEndpoint:
+    Description: RDS PostgreSQL Database Endpoint
+    Value: !GetAtt PeerBridgeDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${Environment}-peerbridge-db-endpoint'
+
+  ApiGatewayUrl:
+    Description: API Gateway URL
+    Value: !Sub 'https://${PeerBridgeApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+    Export:
+      Name: !Sub '${Environment}-peerbridge-api-url'
+
+  StaticWebsiteUrl:
+    Description: Static Website URL
+    Value: !GetAtt StaticWebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${Environment}-peerbridge-website-url'
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt PeerBridgeLambdaFunction.Arn
+    Export:
+      Name: !Sub '${Environment}-peerbridge-lambda-arn'

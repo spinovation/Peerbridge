@@ -1,0 +1,634 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'PeerBridge Complete Infrastructure - Lambda, API Gateway, RDS, S3, and IAM roles'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment name'
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: 'Password for the RDS PostgreSQL database'
+    Default: 'bxWSK7fWIHKDllrc0vVc'
+  
+  SendGridApiKey:
+    Type: String
+    NoEcho: true
+    Description: 'SendGrid API Key for email services'
+    Default: 'your-sendgrid-api-key-here'
+
+Resources:
+  # VPC and Networking
+  PeerBridgeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-vpc'
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-public-subnet-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-public-subnet-2'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      CidrBlock: '10.0.3.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      CidrBlock: '10.0.4.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-private-subnet-2'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PeerBridgeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for RDS PostgreSQL database'
+      VpcId: !Ref PeerBridgeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: 'Allow Lambda functions to access database'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-db-sg'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Lambda functions'
+      VpcId: !Ref PeerBridgeVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-lambda-sg'
+
+  # RDS Database
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'Subnet group for PeerBridge database'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-db-subnet-group'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-peerbridge-db'
+      DBName: 'peerbridge'
+      Engine: 'postgres'
+      EngineVersion: '17.4'
+      DBInstanceClass: 'db.t3.micro'
+      AllocatedStorage: 20
+      StorageType: 'gp2'
+      StorageEncrypted: true
+      MasterUsername: 'peerbridge_admin'
+      MasterUserPassword: !Ref DatabasePassword
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      BackupRetentionPeriod: 7
+      MultiAZ: false
+      PubliclyAccessible: false
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-database'
+
+  # S3 Buckets
+  StaticWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-static-website'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'POST', 'PUT', 'DELETE']
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  StaticWebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticWebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${StaticWebsiteBucket}/*'
+
+  SalesAdminBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-sales-admin'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'POST', 'PUT', 'DELETE']
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  SalesAdminBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SalesAdminBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${SalesAdminBucket}/*'
+
+  UserUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-peerbridge-user-uploads'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'POST', 'PUT', 'DELETE']
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # IAM Roles and Policies
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-peerbridge-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'PeerBridgeLambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${UserUploadsBucket}/*'
+                  - !Sub '${StaticWebsiteBucket}/*'
+                  - !Sub '${SalesAdminBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Ref UserUploadsBucket
+                  - !Ref StaticWebsiteBucket
+                  - !Ref SalesAdminBucket
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/peerbridge/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  # Lambda Function
+  PeerBridgeAPIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-peerbridge-api'
+      Runtime: 'python3.11'
+      Handler: 'main.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps({'message': 'PeerBridge API is running'})
+              }
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt Database.Endpoint.Address
+          DB_NAME: 'peerbridge'
+          DB_USER: 'peerbridge_admin'
+          DB_PASSWORD: !Ref DatabasePassword
+          DB_PORT: '5432'
+          SENDGRID_API_KEY: !Ref SendGridApiKey
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-peerbridge-api-function'
+
+  # API Gateway
+  PeerBridgeAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${Environment}-peerbridge-api'
+      Description: 'PeerBridge REST API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resources
+  APIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !GetAtt PeerBridgeAPI.RootResourceId
+      PathPart: 'api'
+
+  DashboardStatsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !Ref APIResource
+      PathPart: 'dashboard-stats'
+
+  InvitationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !Ref APIResource
+      PathPart: 'invitations'
+
+  EmailResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !Ref APIResource
+      PathPart: 'email'
+
+  SendInvitationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !Ref APIResource
+      PathPart: 'send-invitation'
+
+  AcceptInvitationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ParentId: !Ref APIResource
+      PathPart: 'accept-invitation'
+
+  # API Gateway Methods
+  DashboardStatsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref DashboardStatsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeerBridgeAPIFunction.Arn}/invocations'
+
+  InvitationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref InvitationsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeerBridgeAPIFunction.Arn}/invocations'
+
+  EmailMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref EmailResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeerBridgeAPIFunction.Arn}/invocations'
+
+  SendInvitationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref SendInvitationResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeerBridgeAPIFunction.Arn}/invocations'
+
+  AcceptInvitationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref AcceptInvitationResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeerBridgeAPIFunction.Arn}/invocations'
+
+  # CORS Methods
+  DashboardStatsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref DashboardStatsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  EmailOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      ResourceId: !Ref EmailResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  DashboardStatsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PeerBridgeAPIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PeerBridgeAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DashboardStatsMethod
+      - InvitationsMethod
+      - EmailMethod
+      - SendInvitationMethod
+      - AcceptInvitationMethod
+      - DashboardStatsOptionsMethod
+      - EmailOptionsMethod
+    Properties:
+      RestApiId: !Ref PeerBridgeAPI
+      StageName: 'prod'
+
+  # SSM Parameters for configuration
+  DatabaseHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/peerbridge/database/host'
+      Type: String
+      Value: !GetAtt Database.Endpoint.Address
+      Description: 'Database host endpoint'
+
+  DatabasePasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/peerbridge/database/password'
+      Type: SecureString
+      Value: !Ref DatabasePassword
+      Description: 'Database password'
+
+  SendGridApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/peerbridge/sendgrid/api-key'
+      Type: SecureString
+      Value: !Ref SendGridApiKey
+      Description: 'SendGrid API key'
+
+Outputs:
+  DatabaseEndpoint:
+    Description: 'RDS PostgreSQL database endpoint'
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${Environment}-peerbridge-db-endpoint'
+
+  DatabasePort:
+    Description: 'RDS PostgreSQL database port'
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: !Sub '${Environment}-peerbridge-db-port'
+
+  APIGatewayURL:
+    Description: 'API Gateway URL'
+    Value: !Sub 'https://${PeerBridgeAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${Environment}-peerbridge-api-url'
+
+  StaticWebsiteBucket:
+    Description: 'S3 bucket for static website hosting'
+    Value: !Ref StaticWebsiteBucket
+    Export:
+      Name: !Sub '${Environment}-peerbridge-static-bucket'
+
+  StaticWebsiteURL:
+    Description: 'Static website URL'
+    Value: !GetAtt StaticWebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${Environment}-peerbridge-website-url'
+
+  SalesAdminBucket:
+    Description: 'S3 bucket for sales admin dashboard'
+    Value: !Ref SalesAdminBucket
+    Export:
+      Name: !Sub '${Environment}-peerbridge-sales-admin-bucket'
+
+  SalesAdminURL:
+    Description: 'Sales admin dashboard URL'
+    Value: !GetAtt SalesAdminBucket.WebsiteURL
+    Export:
+      Name: !Sub '${Environment}-peerbridge-sales-admin-url'
+
+  UserUploadsBucket:
+    Description: 'S3 bucket for user uploads'
+    Value: !Ref UserUploadsBucket
+    Export:
+      Name: !Sub '${Environment}-peerbridge-uploads-bucket'
+
+  LambdaFunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref PeerBridgeAPIFunction
+    Export:
+      Name: !Sub '${Environment}-peerbridge-lambda-function'
+
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref PeerBridgeVPC
+    Export:
+      Name: !Sub '${Environment}-peerbridge-vpc-id'
